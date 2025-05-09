@@ -51,6 +51,11 @@ class NMEASentence:
                 calc_cksum ^= ord(c)
                 
             if f"{calc_cksum:02X}" != checksum.strip().upper():  # Make comparison case-insensitive
+                # Add debug logging to show the raw sentence
+                logging.debug(f"Raw NMEA sentence with failed checksum: {line}")
+                logging.debug(f"Sentence part (before *): {sentence}")
+                logging.debug(f"Checksum part (after *): {checksum}")
+                logging.debug(f"Calculated checksum: {calc_cksum:02X}")
                 raise ChecksumError(f"Checksum validation failed: expected {checksum}, got {calc_cksum:02X}")
             
             # Get talker ID and sentence type
@@ -353,10 +358,13 @@ class GPXWriter:
         self.f.write('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')
         self.f.write('<gpx xmlns="http://www.topografix.com/GPX/1/1" ')
         self.f.write('xmlns:nmea="http://www.nmea.org" ')
+        self.f.write('xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v2" ')
         self.f.write('xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ')
         self.f.write('creator="nmea2gpx" version="1.1" ')
         self.f.write('xsi:schemaLocation="http://www.topografix.com/GPX/1/1 ')
-        self.f.write('http://www.topografix.com/GPX/1/1/gpx.xsd">\n')
+        self.f.write('http://www.topografix.com/GPX/1/1/gpx.xsd ')
+        self.f.write('http://www.garmin.com/xmlschemas/TrackPointExtension/v2 ')
+        self.f.write('http://www.garmin.com/xmlschemas/TrackPointExtensionv2.xsd">\n')
         return self
 
     def __exit__(self, exc_type: Optional[Type[BaseException]], 
@@ -424,6 +432,49 @@ class GPXWriter:
             
         self.f.write('        <extensions>\n')
         
+        # First add Garmin TrackPointExtension v2 for supported data
+        has_tpx_data = False
+        
+        # Check if we have any data that fits in the TrackPointExtension schema
+        if (rmc and rmc.speed) or \
+           (vtg and vtg.true_track) or \
+           (gsa and gsa.hdop) or \
+           (gga and gga.hdop):
+            has_tpx_data = True
+            
+        if has_tpx_data:
+            self.f.write('          <gpxtpx:TrackPointExtension>\n')
+            # Add heart rate (not available in our data but included for completeness)
+            # self.f.write('            <gpxtpx:hr>100</gpxtpx:hr>\n')
+            
+            # Add cadence if available (not in our current data)
+            # self.f.write('            <gpxtpx:cad>90</gpxtpx:cad>\n')
+            
+            # Add speed from RMC if available (in m/s)
+            if rmc and rmc.speed:
+                # Convert knots to meters per second (1 knot = 0.514444 m/s)
+                speed_ms = rmc.speed * 0.514444
+                self.f.write(f'            <gpxtpx:speed>{speed_ms:.3f}</gpxtpx:speed>\n')
+            elif vtg and vtg.speed_kmh:
+                # Convert km/h to m/s
+                speed_ms = vtg.speed_kmh / 3.6
+                self.f.write(f'            <gpxtpx:speed>{speed_ms:.3f}</gpxtpx:speed>\n')
+            
+            # Add course
+            if rmc and rmc.course:
+                self.f.write(f'            <gpxtpx:course>{rmc.course:.2f}</gpxtpx:course>\n')
+            elif vtg and vtg.true_track:
+                self.f.write(f'            <gpxtpx:course>{vtg.true_track:.2f}</gpxtpx:course>\n')
+                
+            # Add HDOP
+            if gsa and gsa.hdop:
+                self.f.write(f'            <gpxtpx:hdop>{gsa.hdop:.2f}</gpxtpx:hdop>\n')
+            elif gga and gga.hdop:
+                self.f.write(f'            <gpxtpx:hdop>{gga.hdop:.2f}</gpxtpx:hdop>\n')
+                
+            self.f.write('          </gpxtpx:TrackPointExtension>\n')
+        
+        # Now add remaining NMEA-specific data that doesn't fit the Garmin schema
         if rmc:
             self._write_rmc_extensions(rmc)
         if gga:
@@ -443,12 +494,8 @@ class GPXWriter:
         if not self.f:
             raise RuntimeError("File not opened")
             
-        if rmc.speed:
-            # Convert knots to km/h
-            speed_kmh = rmc.speed * 1.852
-            self.f.write(f'          <nmea:speed>{speed_kmh:.3f}</nmea:speed>\n')
-        if rmc.course:
-            self.f.write(f'          <nmea:course>{rmc.course:.2f}</nmea:course>\n')
+        # Skip speed and course as they're handled by Garmin TrackPointExtension
+        # Only write mag_var which isn't covered by Garmin schema
         if rmc.mag_var:
             self.f.write(f'          <nmea:magvar>{rmc.mag_var:.2f}</nmea:magvar>\n')
 
@@ -459,8 +506,7 @@ class GPXWriter:
             
         if gga.fix_quality:
             self.f.write(f'          <nmea:fix_quality>{gga.fix_quality}</nmea:fix_quality>\n')
-        if gga.hdop:
-            self.f.write(f'          <nmea:hdop>{gga.hdop:.2f}</nmea:hdop>\n')
+        # Skip HDOP as it's handled by Garmin TrackPointExtension
         if gga.altitude and gga.geoid_height:
             self.f.write(f'          <nmea:geoid_height>{gga.geoid_height:.3f}</nmea:geoid_height>\n')
         if gga.dgps_update:
@@ -477,8 +523,7 @@ class GPXWriter:
             self.f.write(f'          <nmea:fix_type>{gsa.mode_fix_type}</nmea:fix_type>\n')
         if gsa.pdop:
             self.f.write(f'          <nmea:pdop>{gsa.pdop:.2f}</nmea:pdop>\n')
-        if gsa.hdop:
-            self.f.write(f'          <nmea:hdop>{gsa.hdop:.2f}</nmea:hdop>\n')
+        # Skip HDOP as it's handled by Garmin TrackPointExtension
         if gsa.vdop:
             self.f.write(f'          <nmea:vdop>{gsa.vdop:.2f}</nmea:vdop>\n')
         if gsa.sv_ids:
@@ -490,14 +535,12 @@ class GPXWriter:
         if not self.f:
             raise RuntimeError("File not opened")
             
-        if vtg.true_track:
-            self.f.write(f'          <nmea:true_track>{vtg.true_track:.2f}</nmea:true_track>\n')
+        # Skip true_track and speed as they're handled by Garmin TrackPointExtension
+        # Only write mag_track and speed formats not covered by Garmin schema
         if vtg.mag_track:
             self.f.write(f'          <nmea:mag_track>{vtg.mag_track:.2f}</nmea:mag_track>\n')
         if vtg.speed_knots:
             self.f.write(f'          <nmea:speed_knots>{vtg.speed_knots:.3f}</nmea:speed_knots>\n')
-        if vtg.speed_kmh:
-            self.f.write(f'          <nmea:speed_kmh>{vtg.speed_kmh:.3f}</nmea:speed_kmh>\n')
 
     def _write_gsv_extensions(self, gsv: GSV) -> None:
         """Write GSV-specific extensions."""
@@ -725,7 +768,42 @@ def delete_source_files(files: List[Path]) -> None:
         except Exception as e:
             logging.error(f"Failed to delete source file {file}: {e}")
 
-def process_files(input_files: List[Union[str, Path]], 
+def expand_input_patterns(input_patterns: List[str]) -> List[Path]:
+    """Expand glob patterns and return sorted list of matching files.
+    
+    Args:
+        input_patterns: List of input patterns (e.g. ["*.ubx", "*.nmea"])
+        
+    Returns:
+        List of matching files sorted by name
+        
+    Raises:
+        ValueError: If no files match any pattern
+    """
+
+        # Expand glob patterns and sort files
+    input_files = []
+    for pattern in input_patterns:
+        # Convert pattern to Path object
+        pattern_path = Path(pattern)
+        # If pattern is absolute, use it as is, otherwise resolve relative to cwd
+        if not pattern_path.is_absolute():
+            pattern_path = Path.cwd() / pattern_path
+            
+        # Get parent directory and pattern
+        parent = pattern_path.parent
+        pattern_str = pattern_path.name
+        
+        # Find matching files
+        matched_files = parent.glob(pattern_str)
+        if not matched_files:
+            raise ValueError(f"No files match pattern: {pattern}")
+        input_files.extend(matched_files)
+
+    return sorted(input_files)
+
+
+def process_files(input_patterns: List[str], 
                 output_file: Union[str, Path], 
                 backup_path: Optional[Union[str, Path]] = None,
                 delete_source: bool = False,
@@ -733,7 +811,7 @@ def process_files(input_files: List[Union[str, Path]],
     """Process one or more NMEA files and write to a single GPX file.
     
     Args:
-        input_files: List of input NMEA files to process
+        input_patterns: List of input NMEA file patterns to process
         output_file: Path to write the GPX output
         backup_path: Optional path to create a backup copy of the GPX file
         delete_source: Optional flag to delete source files after successful conversion
@@ -746,7 +824,9 @@ def process_files(input_files: List[Union[str, Path]],
     """
     
     # Convert all paths to Path objects
-    input_files = [Path(f) for f in input_files]
+    input_files = expand_input_patterns(input_patterns)
+    if not input_files:
+        raise ValueError("No input files found")
     output_file = Path(output_file)
     if backup_path is not None:
         backup_path = Path(backup_path)
@@ -862,29 +942,7 @@ def parse_arguments():
         help='Enable verbose logging'
     )
     
-    args = parser.parse_args()
-    
-    # Expand glob patterns and sort files
-    input_files = []
-    for pattern in args.input_patterns:
-        # Convert pattern to Path object
-        pattern_path = Path(pattern)
-        # If pattern is absolute, use it as is, otherwise resolve relative to cwd
-        if not pattern_path.is_absolute():
-            pattern_path = Path.cwd() / pattern_path
-            
-        # Get parent directory and pattern
-        parent = pattern_path.parent
-        pattern_str = pattern_path.name
-        
-        # Find matching files
-        matched_files = sorted(parent.glob(pattern_str))
-        if not matched_files:
-            parser.error(f"No files match pattern: {pattern}")
-        input_files.extend(matched_files)
-    
-    args.input_files = input_files
-    return args
+    return parser.parse_args()
 
 def main():
     """Main entry point for the script."""
@@ -898,14 +956,14 @@ def main():
     
     try:
         # Convert paths to Path objects
-        input_files = [Path(f) for f in args.input_files]
+        input_patterns = [Path(f) for f in args.input_patterns]
         output_file = Path(args.output)
         backup_path = Path(args.backup) if args.backup else None
         raw_output = Path(args.raw_output) if args.raw_output else None
         
         # Process the files
         process_files(
-            input_files=input_files,
+            input_patterns=input_patterns,
             output_file=output_file,
             backup_path=backup_path,
             delete_source=args.delete_source,
