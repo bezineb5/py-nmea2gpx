@@ -8,6 +8,100 @@ import traceback
 
 log = logging.getLogger(__name__)
 
+def validate_latitude(lat: float) -> bool:
+    """Validate latitude value.
+    
+    Args:
+        lat: Latitude in decimal degrees
+        
+    Returns:
+        True if latitude is valid (-90 to 90), False otherwise
+    """
+    return -90.0 <= lat <= 90.0
+
+def validate_longitude(lon: float) -> bool:
+    """Validate longitude value.
+    
+    Args:
+        lon: Longitude in decimal degrees
+        
+    Returns:
+        True if longitude is valid (-180 to 180), False otherwise
+    """
+    return -180.0 <= lon <= 180.0
+
+def validate_coordinates(lat: float, lon: float) -> bool:
+    """Validate both latitude and longitude coordinates.
+    
+    Args:
+        lat: Latitude in decimal degrees
+        lon: Longitude in decimal degrees
+        
+    Returns:
+        True if both coordinates are valid, False otherwise
+    """
+    return validate_latitude(lat) and validate_longitude(lon)
+
+def detect_gps_errors(lat: float, lon: float) -> List[str]:
+    """Detect common GPS coordinate errors and return a list of issues.
+    
+    Args:
+        lat: Latitude in decimal degrees
+        lon: Longitude in decimal degrees
+        
+    Returns:
+        List of detected error messages (empty if no errors)
+    """
+    errors = []
+    
+    # Check for zero coordinates (common GPS startup issue)
+    if lat == 0.0 and lon == 0.0:
+        errors.append("Zero coordinates detected (likely GPS startup)")
+        errors.append("Coordinates at null island (0,0) - likely invalid")
+    
+    # Check for coordinates that are too close to zero (suspicious)
+    elif abs(lat) < 0.0001 and abs(lon) < 0.0001:
+        errors.append("Coordinates very close to zero (suspicious)")
+    
+    # Note: Coordinates at equator (lat=0.0) and prime meridian (lon=0.0) are normal
+    # and should not be flagged as errors
+    
+    # Check for coordinates that are exactly on the poles
+    if abs(lat) == 90.0:
+        errors.append("Latitude at pole - verify if correct")
+    
+    # Check for coordinates that are exactly on the 180th meridian
+    if abs(lon) == 180.0:
+        errors.append("Longitude at 180th meridian - verify if correct")
+    
+    return errors
+
+def should_reject_coordinates(lat: float, lon: float, strict: bool = False) -> bool:
+    """Determine if coordinates should be rejected based on validation rules.
+    
+    Args:
+        lat: Latitude in decimal degrees
+        lon: Longitude in decimal degrees
+        strict: If True, reject suspicious coordinates
+        
+    Returns:
+        True if coordinates should be rejected, False otherwise
+    """
+    if not strict:
+        return False
+    
+    # In strict mode, reject coordinates that are likely invalid
+    errors = detect_gps_errors(lat, lon)
+    
+    # Reject coordinates with certain types of errors in strict mode
+    rejectable_errors = [
+        "Zero coordinates detected (likely GPS startup)",
+        "Coordinates very close to zero (suspicious)",
+        "Coordinates at null island (0,0) - likely invalid"
+    ]
+    
+    return any(error in errors for error in rejectable_errors)
+
 class ChecksumError(ValueError):
     """Exception raised when NMEA sentence checksum validation fails."""
     pass
@@ -30,12 +124,15 @@ class NMEASentence:
         return True
     
     @staticmethod
-    def parse(line: str) -> 'NMEASentence':
+    def parse(line: str, strict_validation: bool = False) -> 'NMEASentence':
         """Parse a NMEA sentence and return the appropriate sentence object"""
         if not line.startswith('$'):
             raise ValueError("Invalid NMEA sentence")
             
         try:
+            # Remove null bytes from the line first
+            line = line.replace('\x00', '')
+            
             # Remove leading $ and trailing whitespace/newline
             line = line.strip()
             
@@ -73,7 +170,11 @@ class NMEASentence:
             
             # Create sentence object
             if sentence_type in NMEASentence.SENTENCE_TYPES:
-                nmea = NMEASentence.SENTENCE_TYPES[sentence_type](talker, sentence_data, checksum.strip(), sentence_type)
+                sentence_class = NMEASentence.SENTENCE_TYPES[sentence_type]
+                if sentence_type in ['RMC', 'GGA']:
+                    nmea = sentence_class(talker, sentence_data, checksum.strip(), sentence_type, strict_validation)
+                else:
+                    nmea = sentence_class(talker, sentence_data, checksum.strip(), sentence_type)
             else:
                 # Unknown sentence type
                 nmea = NMEASentence(talker, sentence_data, checksum.strip(), sentence_type)
@@ -203,7 +304,7 @@ class RMC(NMEASentence):
             003.1,W      Magnetic Variation
             *6A          Checksum
     """
-    def __init__(self, talker: str, sentence: List[str], checksum: str, sentence_type: str = "RMC") -> None:
+    def __init__(self, talker: str, sentence: List[str], checksum: str, sentence_type: str = "RMC", strict_validation: bool = False) -> None:
         super().__init__(talker, sentence, checksum, sentence_type)
         
         # Parse time and date first
@@ -238,6 +339,11 @@ class RMC(NMEASentence):
             self.latitude: Optional[float] = lat_deg + (lat_min / 60)
             if sentence[3] == 'S':
                 self.latitude = -self.latitude
+                
+            # Validate latitude
+            if not validate_latitude(self.latitude):
+                logging.warning(f"Invalid latitude in RMC: {self.latitude}")
+                self.latitude = None
         else:
             self.latitude = None
             
@@ -249,6 +355,23 @@ class RMC(NMEASentence):
             self.longitude: Optional[float] = lon_deg + (lon_min / 60)
             if sentence[5] == 'W':
                 self.longitude = -self.longitude
+                
+            # Validate longitude
+            if not validate_longitude(self.longitude):
+                logging.warning(f"Invalid longitude in RMC: {self.longitude}")
+                self.longitude = None
+            else:
+                # Check for GPS errors if we have both coordinates
+                if self.latitude is not None:
+                    errors = detect_gps_errors(self.latitude, self.longitude)
+                    for error in errors:
+                        logging.warning(f"RMC coordinate issue: {error} (lat={self.latitude}, lon={self.longitude})")
+                    
+                    # Reject coordinates in strict mode
+                    if should_reject_coordinates(self.latitude, self.longitude, strict_validation):
+                        logging.warning(f"Rejecting RMC coordinates in strict mode: lat={self.latitude}, lon={self.longitude}")
+                        self.latitude = None
+                        self.longitude = None
         else:
             self.longitude = None
             
@@ -291,7 +414,7 @@ class GGA(NMEASentence):
             (empty field) DGPS station ID number
             *47          Checksum
     """
-    def __init__(self, talker: str, sentence: List[str], checksum: str, sentence_type: str = "GGA") -> None:
+    def __init__(self, talker: str, sentence: List[str], checksum: str, sentence_type: str = "GGA", strict_validation: bool = False) -> None:
         super().__init__(talker, sentence, checksum, sentence_type)
         
         # Parse time
@@ -313,6 +436,11 @@ class GGA(NMEASentence):
             self.latitude: Optional[float] = lat_deg + (lat_min / 60)
             if sentence[2] == 'S':
                 self.latitude = -self.latitude
+                
+            # Validate latitude
+            if not validate_latitude(self.latitude):
+                logging.warning(f"Invalid latitude in GGA: {self.latitude}")
+                self.latitude = None
         else:
             self.latitude = None
             
@@ -324,6 +452,23 @@ class GGA(NMEASentence):
             self.longitude: Optional[float] = lon_deg + (lon_min / 60)
             if sentence[4] == 'W':
                 self.longitude = -self.longitude
+                
+            # Validate longitude
+            if not validate_longitude(self.longitude):
+                logging.warning(f"Invalid longitude in GGA: {self.longitude}")
+                self.longitude = None
+            else:
+                # Check for GPS errors if we have both coordinates
+                if self.latitude is not None:
+                    errors = detect_gps_errors(self.latitude, self.longitude)
+                    for error in errors:
+                        logging.warning(f"GGA coordinate issue: {error} (lat={self.latitude}, lon={self.longitude})")
+                    
+                    # Reject coordinates in strict mode
+                    if should_reject_coordinates(self.latitude, self.longitude, strict_validation):
+                        logging.warning(f"Rejecting GGA coordinates in strict mode: lat={self.latitude}, lon={self.longitude}")
+                        self.latitude = None
+                        self.longitude = None
         else:
             self.longitude = None
         
@@ -348,23 +493,25 @@ NMEASentence.SENTENCE_TYPES = {
 class GPXWriter:
     """Writes GPX format files with NMEA extensions."""
     
-    def __init__(self, output_file: Path) -> None:
+    def __init__(self, output_file: Path, compact: bool = False) -> None:
         self.output_file: Path = Path(output_file)
         self.track_started: bool = False
         self.f: Optional[TextIO] = None
+        self.compact: bool = compact
 
     def __enter__(self) -> 'GPXWriter':
         self.f = self.output_file.open('w')
-        self.f.write('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')
-        self.f.write('<gpx xmlns="http://www.topografix.com/GPX/1/1" ')
-        self.f.write('xmlns:nmea="http://www.nmea.org" ')
-        self.f.write('xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v2" ')
-        self.f.write('xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ')
-        self.f.write('creator="nmea2gpx" version="1.1" ')
-        self.f.write('xsi:schemaLocation="http://www.topografix.com/GPX/1/1 ')
-        self.f.write('http://www.topografix.com/GPX/1/1/gpx.xsd ')
-        self.f.write('http://www.garmin.com/xmlschemas/TrackPointExtension/v2 ')
-        self.f.write('http://www.garmin.com/xmlschemas/TrackPointExtensionv2.xsd">\n')
+        self.write_line('<?xml version="1.0" encoding="UTF-8" standalone="no"?>')
+        gpx_header = '''<gpx xmlns="http://www.topografix.com/GPX/1/1" '''
+        gpx_header += 'xmlns:nmea="http://www.nmea.org" '
+        gpx_header += 'xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v2" '
+        gpx_header += 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        gpx_header += 'creator="nmea2gpx" version="1.1" '
+        gpx_header += 'xsi:schemaLocation="http://www.topografix.com/GPX/1/1 '
+        gpx_header += 'http://www.topografix.com/GPX/1/1/gpx.xsd '
+        gpx_header += 'http://www.garmin.com/xmlschemas/TrackPointExtension/v2 '
+        gpx_header += 'http://www.garmin.com/xmlschemas/TrackPointExtensionv2.xsd">'
+        self.write_line(gpx_header)
         return self
 
     def __exit__(self, exc_type: Optional[Type[BaseException]], 
@@ -373,16 +520,22 @@ class GPXWriter:
         if self.track_started:
             self.end_track()
         if self.f:
-            self.f.write('</gpx>\n')
+            self.write_line('</gpx>')
             self.f.close()
+
+    def write_line(self, data: str) -> None:
+        if self.compact:
+            self.f.write(data.strip())
+        else:
+            self.f.write(data + '\n')
 
     def start_track(self, name: Optional[str] = None) -> None:
         if not self.f:
             raise RuntimeError("File not opened")
-        self.f.write('  <trk>\n')
+        self.write_line('  <trk>')
         if name:
-            self.f.write(f'    <name>{name}</name>\n')
-        self.f.write('    <trkseg>\n')
+            self.write_line(f'    <name>{name}</name>')
+        self.write_line('    <trkseg>')
         self.track_started = True
 
     def add_trackpoint(self, rmc: Optional[RMC] = None, 
@@ -405,18 +558,18 @@ class GPXWriter:
         if pos.latitude is None or pos.longitude is None:
             return
         
-        self.f.write(f'      <trkpt lat="{pos.latitude:.8f}" lon="{pos.longitude:.8f}">\n')
+        self.write_line(f'      <trkpt lat="{pos.latitude:.8f}" lon="{pos.longitude:.8f}">')
         
         if gga and gga.altitude is not None:
-            self.f.write(f'        <ele>{gga.altitude:.3f}</ele>\n')
+            self.write_line(f'        <ele>{gga.altitude:.3f}</ele>')
             
         if pos.time:
             # Format timestamp in ISO 8601 format with UTC timezone
             ts = pos.time.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            self.f.write(f'        <time>{ts}</time>\n')
+            self.write_line(f'        <time>{ts}</time>')
 
         if gga and gga.num_sats:
-            self.f.write(f'        <sat>{gga.num_sats}</sat>\n')
+            self.write_line(f'        <sat>{gga.num_sats}</sat>')
 
         # Add NMEA extensions
         self._write_extensions(rmc, gga, gsa, vtg, gsv)
@@ -430,7 +583,7 @@ class GPXWriter:
         if not self.f:
             raise RuntimeError("File not opened")
             
-        self.f.write('        <extensions>\n')
+        self.write_line('        <extensions>')
         
         # First add Garmin TrackPointExtension v2 for supported data
         has_tpx_data = False
@@ -443,36 +596,36 @@ class GPXWriter:
             has_tpx_data = True
             
         if has_tpx_data:
-            self.f.write('          <gpxtpx:TrackPointExtension>\n')
+            self.write_line('          <gpxtpx:TrackPointExtension>')
             # Add heart rate (not available in our data but included for completeness)
-            # self.f.write('            <gpxtpx:hr>100</gpxtpx:hr>\n')
+            # self.write_line('            <gpxtpx:hr>100</gpxtpx:hr>')
             
             # Add cadence if available (not in our current data)
-            # self.f.write('            <gpxtpx:cad>90</gpxtpx:cad>\n')
+            # self.write_line('            <gpxtpx:cad>90</gpxtpx:cad>')
             
             # Add speed from RMC if available (in m/s)
             if rmc and rmc.speed:
                 # Convert knots to meters per second (1 knot = 0.514444 m/s)
                 speed_ms = rmc.speed * 0.514444
-                self.f.write(f'            <gpxtpx:speed>{speed_ms:.3f}</gpxtpx:speed>\n')
+                self.write_line(f'            <gpxtpx:speed>{speed_ms:.3f}</gpxtpx:speed>')
             elif vtg and vtg.speed_kmh:
                 # Convert km/h to m/s
                 speed_ms = vtg.speed_kmh / 3.6
-                self.f.write(f'            <gpxtpx:speed>{speed_ms:.3f}</gpxtpx:speed>\n')
+                self.write_line(f'            <gpxtpx:speed>{speed_ms:.3f}</gpxtpx:speed>')
             
             # Add course
             if rmc and rmc.course:
-                self.f.write(f'            <gpxtpx:course>{rmc.course:.2f}</gpxtpx:course>\n')
+                self.write_line(f'            <gpxtpx:course>{rmc.course:.2f}</gpxtpx:course>')
             elif vtg and vtg.true_track:
-                self.f.write(f'            <gpxtpx:course>{vtg.true_track:.2f}</gpxtpx:course>\n')
+                self.write_line(f'            <gpxtpx:course>{vtg.true_track:.2f}</gpxtpx:course>')
                 
             # Add HDOP
             if gsa and gsa.hdop:
-                self.f.write(f'            <gpxtpx:hdop>{gsa.hdop:.2f}</gpxtpx:hdop>\n')
+                self.write_line(f'            <gpxtpx:hdop>{gsa.hdop:.2f}</gpxtpx:hdop>')
             elif gga and gga.hdop:
-                self.f.write(f'            <gpxtpx:hdop>{gga.hdop:.2f}</gpxtpx:hdop>\n')
+                self.write_line(f'            <gpxtpx:hdop>{gga.hdop:.2f}</gpxtpx:hdop>')
                 
-            self.f.write('          </gpxtpx:TrackPointExtension>\n')
+            self.write_line('          </gpxtpx:TrackPointExtension>')
         
         # Now add remaining NMEA-specific data that doesn't fit the Garmin schema
         if rmc:
@@ -486,8 +639,8 @@ class GPXWriter:
         if gsv:
             self._write_gsv_extensions(gsv)
             
-        self.f.write('        </extensions>\n')
-        self.f.write('      </trkpt>\n')
+        self.write_line('        </extensions>')
+        self.write_line('      </trkpt>')
 
     def _write_rmc_extensions(self, rmc: RMC) -> None:
         """Write RMC-specific extensions."""
@@ -497,7 +650,7 @@ class GPXWriter:
         # Skip speed and course as they're handled by Garmin TrackPointExtension
         # Only write mag_var which isn't covered by Garmin schema
         if rmc.mag_var:
-            self.f.write(f'          <nmea:magvar>{rmc.mag_var:.2f}</nmea:magvar>\n')
+            self.write_line(f'          <nmea:magvar>{rmc.mag_var:.2f}</nmea:magvar>')
 
     def _write_gga_extensions(self, gga: GGA) -> None:
         """Write GGA-specific extensions."""
@@ -505,14 +658,14 @@ class GPXWriter:
             raise RuntimeError("File not opened")
             
         if gga.fix_quality:
-            self.f.write(f'          <nmea:fix_quality>{gga.fix_quality}</nmea:fix_quality>\n')
+            self.write_line(f'          <nmea:fix_quality>{gga.fix_quality}</nmea:fix_quality>')
         # Skip HDOP as it's handled by Garmin TrackPointExtension
         if gga.altitude and gga.geoid_height:
-            self.f.write(f'          <nmea:geoid_height>{gga.geoid_height:.3f}</nmea:geoid_height>\n')
+            self.write_line(f'          <nmea:geoid_height>{gga.geoid_height:.3f}</nmea:geoid_height>')
         if gga.dgps_update:
-            self.f.write(f'          <nmea:dgps_age>{gga.dgps_update:.1f}</nmea:dgps_age>\n')
+            self.write_line(f'          <nmea:dgps_age>{gga.dgps_update:.1f}</nmea:dgps_age>')
         if gga.dgps_station:
-            self.f.write(f'          <nmea:dgps_station>{gga.dgps_station}</nmea:dgps_station>\n')
+            self.write_line(f'          <nmea:dgps_station>{gga.dgps_station}</nmea:dgps_station>')
 
     def _write_gsa_extensions(self, gsa: GSA) -> None:
         """Write GSA-specific extensions."""
@@ -520,15 +673,15 @@ class GPXWriter:
             raise RuntimeError("File not opened")
             
         if gsa.mode_fix_type:
-            self.f.write(f'          <nmea:fix_type>{gsa.mode_fix_type}</nmea:fix_type>\n')
+            self.write_line(f'          <nmea:fix_type>{gsa.mode_fix_type}</nmea:fix_type>')
         if gsa.pdop:
-            self.f.write(f'          <nmea:pdop>{gsa.pdop:.2f}</nmea:pdop>\n')
+            self.write_line(f'          <nmea:pdop>{gsa.pdop:.2f}</nmea:pdop>')
         # Skip HDOP as it's handled by Garmin TrackPointExtension
         if gsa.vdop:
-            self.f.write(f'          <nmea:vdop>{gsa.vdop:.2f}</nmea:vdop>\n')
+            self.write_line(f'          <nmea:vdop>{gsa.vdop:.2f}</nmea:vdop>')
         if gsa.sv_ids:
             sv_ids_str = ','.join(map(str, gsa.sv_ids))
-            self.f.write(f'          <nmea:active_sats>{sv_ids_str}</nmea:active_sats>\n')
+            self.write_line(f'          <nmea:active_sats>{sv_ids_str}</nmea:active_sats>')
 
     def _write_vtg_extensions(self, vtg: VTG) -> None:
         """Write VTG-specific extensions."""
@@ -538,9 +691,9 @@ class GPXWriter:
         # Skip true_track and speed as they're handled by Garmin TrackPointExtension
         # Only write mag_track and speed formats not covered by Garmin schema
         if vtg.mag_track:
-            self.f.write(f'          <nmea:mag_track>{vtg.mag_track:.2f}</nmea:mag_track>\n')
+            self.write_line(f'          <nmea:mag_track>{vtg.mag_track:.2f}</nmea:mag_track>')
         if vtg.speed_knots:
-            self.f.write(f'          <nmea:speed_knots>{vtg.speed_knots:.3f}</nmea:speed_knots>\n')
+            self.write_line(f'          <nmea:speed_knots>{vtg.speed_knots:.3f}</nmea:speed_knots>')
 
     def _write_gsv_extensions(self, gsv: GSV) -> None:
         """Write GSV-specific extensions."""
@@ -548,28 +701,28 @@ class GPXWriter:
             raise RuntimeError("File not opened")
             
         if gsv.sat_data:
-            self.f.write('          <nmea:satellites>\n')
+            self.write_line('          <nmea:satellites>')
             for i, sat in enumerate(gsv.sat_data[:4]):  # Limit to first 4 sats
-                self.f.write('            <nmea:sat>\n')
-                self.f.write(f'              <nmea:prn>{sat.prn}</nmea:prn>\n')
+                self.write_line('            <nmea:sat>')
+                self.write_line(f'              <nmea:prn>{sat.prn}</nmea:prn>')
                 if sat.elevation is not None:
-                    self.f.write(f'              <nmea:elevation>{sat.elevation}</nmea:elevation>\n')
+                    self.write_line(f'              <nmea:elevation>{sat.elevation}</nmea:elevation>')
                 if sat.azimuth is not None:
-                    self.f.write(f'              <nmea:azimuth>{sat.azimuth}</nmea:azimuth>\n')
+                    self.write_line(f'              <nmea:azimuth>{sat.azimuth}</nmea:azimuth>')
                 if sat.snr is not None:
-                    self.f.write(f'              <nmea:snr>{sat.snr}</nmea:snr>\n')
-                self.f.write('            </nmea:sat>\n')
-            self.f.write('          </nmea:satellites>\n')
+                    self.write_line(f'              <nmea:snr>{sat.snr}</nmea:snr>')
+                self.write_line('            </nmea:sat>')
+            self.write_line('          </nmea:satellites>')
 
     def end_track(self) -> None:
         """End the current track segment."""
         if not self.f:
             raise RuntimeError("File not opened")
-        self.f.write('    </trkseg>\n')
-        self.f.write('  </trk>\n')
+        self.write_line('    </trkseg>')
+        self.write_line('  </trk>')
         self.track_started = False 
 
-def parse_nmea_stream(input_file: Path) -> Generator[NMEASentence, None, None]:
+def parse_nmea_stream(input_file: Path, strict_validation: bool = False) -> Generator[NMEASentence, None, None]:
     """Parse NMEA sentences from a file, yielding valid sentences.
     
     Args:
@@ -593,8 +746,15 @@ def parse_nmea_stream(input_file: Path) -> Generator[NMEASentence, None, None]:
                     # NMEA is ASCII-based, so this is safe
                     line_str = line.decode('ascii', errors='ignore').strip()
                     
+                    # Remove null bytes that may be present in preallocated files
+                    line_str = line_str.replace('\x00', '')
+                    
+                    # Skip empty lines after null removal
+                    if not line_str.strip():
+                        continue
+                    
                     # Parse NMEA sentence
-                    sentence = NMEASentence.parse(line_str)
+                    sentence = NMEASentence.parse(line_str, strict_validation)
                     
                     # Skip if checksum validation fails
                     if not sentence.is_valid:
@@ -807,7 +967,9 @@ def process_files(input_patterns: List[str],
                 output_file: Union[str, Path], 
                 backup_path: Optional[Union[str, Path]] = None,
                 delete_source: bool = False,
-                raw_output: Optional[Union[str, Path]] = None) -> None:
+                raw_output: Optional[Union[str, Path]] = None,
+                strict_validation: bool = False,
+                compact: bool = False) -> None:
     """Process one or more NMEA files and write to a single GPX file.
     
     Args:
@@ -841,18 +1003,24 @@ def process_files(input_patterns: List[str],
     conversion_successful: bool = False
     
     try:
-        # If raw output is requested, concatenate all input files
+        # If raw output is requested, concatenate all input files with null byte removal
         if raw_output:
             with raw_output.open('wb') as outfile:
                 for input_file in sorted_files:
                     try:
                         with input_file.open('rb') as infile:
-                            shutil.copyfileobj(infile, outfile)
+                            # Read and write line by line, removing null bytes
+                            for line in infile:
+                                # Remove null bytes from the line
+                                cleaned_line = line.replace(b'\x00', b'')
+                                # Only write non-empty lines
+                                if cleaned_line.strip():
+                                    outfile.write(cleaned_line)
                     except Exception as e:
                         logging.error(f"Error concatenating file {input_file}: {e}")
                         continue
         
-        with GPXWriter(output_file) as writer:
+        with GPXWriter(output_file, compact=compact) as writer:
             writer.start_track()
             
             # Process files in sorted order
@@ -860,7 +1028,7 @@ def process_files(input_patterns: List[str],
                 try:
                     logging.info(f"Processing file: {input_file}")
                     # Create a streaming pipeline for NMEA data
-                    sentences = parse_nmea_stream(input_file)
+                    sentences = parse_nmea_stream(input_file, strict_validation)
                     for point in group_nmea_points(sentences):
                         logging.debug(f"Processing point: RMC={point['rmc']}, GGA={point['gga']}")
                         writer.add_trackpoint(
@@ -942,6 +1110,18 @@ def parse_arguments():
         help='Enable verbose logging'
     )
     
+    parser.add_argument(
+        '--strict-validation',
+        action='store_true',
+        help='Enable strict coordinate validation (reject suspicious coordinates)'
+    )
+    
+    parser.add_argument(
+        '--compact',
+        action='store_true',
+        help='Write compact GPX file'
+    )
+    
     return parser.parse_args()
 
 def main():
@@ -967,7 +1147,9 @@ def main():
             output_file=output_file,
             backup_path=backup_path,
             delete_source=args.delete_source,
-            raw_output=raw_output
+            raw_output=raw_output,
+            strict_validation=args.strict_validation,
+            compact=args.compact
         )
         
     except Exception as e:
