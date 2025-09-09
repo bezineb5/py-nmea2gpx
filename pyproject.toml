@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "nmea2gpx"
 version = "0.1"
 description = "Converts NMEA files to GPX files"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Benjamin Bezine"}
 ]
@@ -14,7 +14,6 @@ urls = {Homepage = "https://github.com/bezineb5/py-nmea2gpx"}
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Programming Language :: Python :: 3.5",
     "Topic :: Multimedia"
 ]

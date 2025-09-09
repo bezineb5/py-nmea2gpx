@@ -15,18 +15,69 @@ A Python tool for converting NMEA GPS data to GPX format with comprehensive coor
 
 ## Installation
 
+### Option 1: Install from PyPI (Recommended)
+
+```bash
+pip install nmea2gpx
+```
+
+### Option 2: Install from Source
+
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd nmea2gpx
+git clone https://github.com/bezineb5/py-nmea2gpx.git
+cd py-nmea2gpx
 
-# Install dependencies (if any)
-pip install -r requirements.txt
+# Install the package
+pip install .
 ```
+
+### Option 3: Build and Install Wheel
+
+```bash
+# Clone the repository
+git clone https://github.com/bezineb5/py-nmea2gpx.git
+cd py-nmea2gpx
+
+# Install build tools
+pip install build
+
+# Build the wheel
+python3 -m build
+
+# Install the wheel
+pip install dist/nmea2gpx-0.1-py3-none-any.whl
+```
+
+### Dependencies
+
+The package has no external dependencies - it uses only Python standard library modules.
 
 ## Usage
 
 ### Basic Usage
+
+After installation, you can use the `nmea2gpx` command:
+
+```bash
+# Convert a single NMEA file to GPX
+nmea2gpx input.nmea -o output.gpx
+
+# Convert multiple files using glob patterns
+nmea2gpx "*.nmea" "*.ubx" -o output.gpx
+```
+
+Or run directly as a Python module:
+
+```bash
+# Convert a single NMEA file to GPX
+python3 -m nmea2gpx input.nmea -o output.gpx
+
+# Convert multiple files using glob patterns
+python3 -m nmea2gpx "*.nmea" "*.ubx" -o output.gpx
+```
+
+If running from source without installation:
 
 ```bash
 # Convert a single NMEA file to GPX
@@ -57,7 +108,7 @@ Use `--strict-validation` to reject coordinates that are likely invalid:
 
 ```bash
 # Reject suspicious coordinates
-python3 nmea2gpx.py input.nmea -o output.gpx --strict-validation
+nmea2gpx input.nmea -o output.gpx --strict-validation
 ```
 
 In strict mode, the following coordinates are rejected:
@@ -68,7 +119,7 @@ In strict mode, the following coordinates are rejected:
 ### Command Line Options
 
 ```bash
-python3 nmea2gpx.py [OPTIONS] INPUT_PATTERNS... -o OUTPUT_FILE
+nmea2gpx [OPTIONS] INPUT_PATTERNS... -o OUTPUT_FILE
 
 Options:
   -o, --output FILE          Output GPX file (required)
@@ -84,16 +135,16 @@ Options:
 
 ```bash
 # Basic conversion with warnings
-python3 nmea2gpx.py gps_data.nmea -o track.gpx
+nmea2gpx gps_data.nmea -o track.gpx
 
 # Strict validation with verbose logging
-python3 nmea2gpx.py gps_data.nmea -o track.gpx --strict-validation -v
+nmea2gpx gps_data.nmea -o track.gpx --strict-validation -v
 
 # Process multiple files with backup
-python3 nmea2gpx.py "*.nmea" -o combined.gpx -b backup.gpx
+nmea2gpx "*.nmea" -o combined.gpx -b backup.gpx
 
 # Convert and delete source files
-python3 nmea2gpx.py "*.nmea" -o output.gpx --delete-source
+nmea2gpx "*.nmea" -o output.gpx --delete-source
 ```
 
 ## Coordinate Validation Details
